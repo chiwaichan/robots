@@ -59,5 +59,6 @@ fi
 
 echo
 cd "$REPO"
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 exec env GROOT_SERVER_HOST="$HOST" GROOT_SERVER_PORT="$PORT" \
-  python "$HOME/groot_infer_demo.py" "$@"
+  python "$HERE/groot_infer_demo.py" "$@"
