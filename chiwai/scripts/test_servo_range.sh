@@ -4,9 +4,11 @@
 # 12 tested positions, each read back and reported pass/fail.
 #
 # Gripper note: it is TORQUE-limited, not hard-stopped (see chiwai/SO101_SERVO_RANGES.md).
-# Under stock conservative torque limits it stalls/overheats past ~74 normalized, so the
-# gripper is capped at --gripper-max (default 74). After raising the gripper torque limits,
-# run with e.g. --gripper-max 98 to test its full open/close range.
+# The stock 50% torque cap is a DELIBERATE anti-burnout mitigation (lerobot PR #1809); driving
+# the gripper to its open extreme stalls it -> standing-error I2R heat. The servo is healthy
+# (0 mA + cooling at a reachable hold). So the gripper is capped at --gripper-max (default 74).
+# Do NOT raise the torque limits to go higher -- instead recalibrate range_max a few degrees
+# inside the open stop, then --gripper-max ~98 maps to a reachable "open".
 #
 # Usage:
 #   ./test_servo_range.sh                 # +/-50% of range, gentle ramps

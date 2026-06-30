@@ -48,9 +48,21 @@ Earlier (under motor power) the gripper would only reach **normalized ~74 (raw ~
   `Max_Torque_Limit = 500` (50%), `Overload_Torque = 25%`, `Protection_Current = 250`.
   When the gripper meets normal mechanism resistance, that throttled torque + early overload trip cuts power mid-travel, it stalls, and a stalled servo heats up (saw 58°C vs ~33°C on the others). The latch then needs a power-cycle (and several minutes to actually cool).
 - **Closed position is correct:** raw ~2042–2048 ≈ normalized 0.2–0.6, sitting on `range_min` (2039). Encoder/closed calibration is fine.
-- **Fix:** **raise the gripper's torque limits** (not clamp its range). Suggested: `Max_Torque_Limit` 500→**850**, `Overload_Torque` 25→**60**, `Protection_Current` 250→**400**.
 
-> Supersedes the "gripper range_max overshoots the physical stop" note in the companion doc — the gripper has no hard-stop there; it was torque-starved.
+### VERIFIED root cause + correct fix (2026-07-01)
+
+Confirmed by code, web research, **and direct measurement** — the gripper servo is **HEALTHY**, not failing:
+- **Idle test (decisive):** held at a *reachable* position (norm ~16) with torque ON, the gripper drew **0 mA for 30s and the temperature *fell*** (50→42°C across runs). A faulty servo would draw current and heat *here*; it doesn't. So at any reachable position with no standing error → ~0 current → it cools.
+- **Mechanism = standing-error stall → I²R heat, not a fault.** Commanded to its open extreme, the deliberately-capped torque can't reach the goal, so it **stalls with a standing position error**; a blocked rotor does no mechanical work → all drive power becomes winding heat. There is **no spring** in the SO-ARM gripper (direct servo-driven jaw), confirming a pure position-error stall.
+- **The conservative limits are a DELIBERATE anti-burnout mitigation:** [lerobot PR #1809](https://github.com/huggingface/lerobot/pull/1809) "Lower limits by 50% for current and torque for gripper motor" (2025-08-29) added exactly `Torque_Limit=500`/`Overload_Torque=25`/`Protection_Current=250` to prevent gripper burnout "reported by Seeed Studio." These are the FIX for a known SO-ARM problem, not the bug.
+- **What triggered the overheating here:** driving the gripper to/past its calibrated open extreme (unreachable under the safe torque) **+ leaving torque ON when parked** (the diagnostic scripts' `disable_torque_on_disconnect=False`).
+
+**Correct fix — do NOT raise the torque (that re-introduces the burnout PR #1809 prevents):**
+1. **Recalibrate** so gripper `range_max` is recorded a few degrees *inside* the open hard-stop → "open" (100) becomes reachable → error→0 → no heat. *(Proper fix.)*
+2. **Cap the open command** so it's never driven to the stall point (`--gripper-max`).
+3. **Release gripper torque when idle/parked** (don't leave it energized holding an error).
+
+> Supersedes BOTH the earlier "raise the torque limits" suggestion AND the "range_max overshoots a physical hard-stop" note — both were wrong. Root cause is a standing-error stall against an unreachable open goal under the (intentional) safe torque cap.
 
 ---
 
@@ -76,15 +88,9 @@ During the "move all joints through their range" step, **fully rotate `shoulder_
 | wrist_roll    | 560  | 3239 |
 | gripper       | 2032 | 3474 |
 
-### B. Raise the gripper torque limits (so it actuates its full range)
+### B. Do NOT raise the gripper torque limits
 
-One-time write to the gripper's STS3215 EEPROM (`chiwai/scripts/set_gripper_torque.sh`, TBD):
-```
-Max_Torque_Limit : 500 -> 850
-Overload_Torque  : 25  -> 60
-Protection_Current: 250 -> 400
-```
-Do this only when the gripper has cooled to ~33°C.
+An earlier draft suggested raising them — that is the **wrong** fix. Per [lerobot PR #1809](https://github.com/huggingface/lerobot/pull/1809) the 50% caps exist *specifically* to prevent gripper burnout; raising them just makes a stalled servo push harder = more heat. Idle measurement proved the servo is healthy (0 mA + cooling at a reachable held position), so there is nothing to "fix" in the servo. Instead make the open goal reachable (recalibrate `range_max` inward / cap the open command) and release gripper torque when idle — see **Finding 2 → VERIFIED root cause** above.
 
 ---
 
