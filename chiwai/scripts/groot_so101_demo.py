@@ -26,9 +26,15 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import time
 
 import numpy as np
+
+try:
+    import cv2                            # for --save-frames
+except Exception:                         # noqa: BLE001
+    cv2 = None
 
 from strands_robots import Robot
 from strands_robots.policies.groot.client import Gr00tInferenceClient
@@ -114,18 +120,40 @@ def robust_send(robot, cmd, tries: int = 5, delay: float = 0.05):
     raise last
 
 
-def clamp_action(cmd: dict, cur: dict, max_arm: float, max_grip: float) -> dict:
-    """Safety: limit how far any joint can move from its CURRENT angle per step.
+def clamp_action(cmd: dict, cur: dict, max_arm: float, max_grip: float,
+                 grip_lo: float = 1.0, grip_hi: float = 74.0) -> dict:
+    """Safety: limit how far any joint moves per step, AND cap the gripper to a
+    torque-safe ABSOLUTE range.
 
-    Guarantees gentle motion regardless of what the policy emits. arm joints are
-    capped at +/-max_arm degrees, the gripper at +/-max_grip (0-100 range).
+    Two independent guards on the gripper:
+      1. per-step rate limit (+/-max_grip) -> gentle motion, no current spikes;
+      2. absolute [grip_lo, grip_hi] cap    -> the policy can NEVER walk the
+         gripper to the unreachable open extreme, where it stalls against a
+         standing position error and overheats (I2R). See
+         chiwai/SO101_SERVO_RANGES.md (VERIFIED root cause) + lerobot PR #1809.
+    Arm joints get the rate limit only.
     """
     out = {}
     for k, target in cmd.items():
         now = float(cur[k])
         lim = max_grip if k == "gripper.pos" else max_arm
-        out[k] = now + max(-lim, min(lim, target - now))
+        val = now + max(-lim, min(lim, target - now))
+        if k == "gripper.pos":
+            val = max(grip_lo, min(grip_hi, val))     # absolute torque-safe cap
+        out[k] = val
     return out
+
+
+def ramp_to(robot, targets: dict, secs: float = 2.5, rate: float = 30.0):
+    """Smoothly ramp all joints from the current pose to `targets` {motor.pos: val}."""
+    start = robust_read(robot)
+    n = max(1, int(secs * rate))
+    period = 1.0 / rate
+    for i in range(1, n + 1):
+        a = i / n
+        step = {k: float(start[k]) * (1 - a) + float(v) * a for k, v in targets.items()}
+        robust_send(robot, step)
+        time.sleep(period)
 
 
 def main():
@@ -141,6 +169,12 @@ def main():
     ap.add_argument("--hz", type=float, default=5.0)
     ap.add_argument("--max-step-deg", type=float, default=6.0, help="max arm-joint move per step (deg)")
     ap.add_argument("--max-grip-step", type=float, default=25.0, help="max gripper move per step")
+    ap.add_argument("--grip-min", type=float, default=1.0,
+                    help="absolute gripper floor (normalized) — keep off the hard-closed stop")
+    ap.add_argument("--grip-max", type=float, default=74.0,
+                    help="absolute gripper ceiling (normalized) — torque-safe open limit; the policy "
+                         "is never allowed past this so it can't stall/overheat. Raise toward ~95 "
+                         "only AFTER recalibrating range_max at the natural open stop.")
     # MJPG (compressed) by default: 2 USB cams at 640x480x30 RAW (YUYV) saturate
     # the Jetson USB bus and corrupt the 1Mbaud servo serial link ("incorrect
     # status packet"). MJPG is ~10x less bandwidth at the same resolution, which
@@ -153,6 +187,16 @@ def main():
                     help="one physical camera (front) fed into BOTH model inputs (front+wrist); "
                          "no wrist cam opened — halves USB load, fits the 1-cam-on-USB-A setup")
     ap.add_argument("--dry-run", action="store_true", help="infer + print, never command motors")
+    ap.add_argument("--action-horizon", type=int, default=16,
+                    help="how many steps of GR00T's predicted action CHUNK to execute per inference "
+                         "(the policy predicts a whole trajectory; executing only step 0 makes it crawl). "
+                         "Clamped to the chunk length the server returns.")
+    ap.add_argument("--home-first", action="store_true",
+                    help="ramp the arm to a neutral pose BEFORE the GR00T loop, so the policy's "
+                         "target is far away -> a big, visible sweep instead of holding in place")
+    ap.add_argument("--save-frames", default="",
+                    help="dir to dump the exact camera frame(s) sent to GR00T each step "
+                         "(so you can SEE what the policy sees — wall vs cube). Needs opencv.")
     args = ap.parse_args()
 
     def cam(idx):
@@ -189,20 +233,56 @@ def main():
              "  [DRY-RUN: motors will NOT move]" if args.dry_run else "")
 
     period = 1.0 / args.hz
+    JOINTS = ARM + ["gripper"]
+
+    # Home to a neutral pose first so GR00T's target is FAR from the start ->
+    # a big, visible excursion instead of holding wherever the arm already sat.
+    if args.home_first and not args.dry_run:
+        neutral = {f"{m}.pos": 0.0 for m in ARM}
+        neutral["gripper.pos"] = max(args.grip_min, 20.0)
+        log.info("homing to neutral before GR00T (for a big visible move)...")
+        ramp_to(robot, neutral, secs=2.5)
+
+    if args.save_frames:
+        os.makedirs(args.save_frames, exist_ok=True)
+
+    cmd_min = {j: 1e9 for j in JOINTS}
+    cmd_max = {j: -1e9 for j in JOINTS}
     try:
-        for step in range(args.steps):
+        for infer_i in range(args.steps):
             raw = robust_read(robot)
+            if args.save_frames and cv2 is not None:          # dump what GR00T sees
+                cv2.imwrite(f"{args.save_frames}/infer{infer_i:02d}_front.jpg",
+                            np.asarray(raw["front"])[..., ::-1])
             t = time.time()
             actions = client.get_action(build_nested_obs(raw, args.task))
             dt = time.time() - t
-            target = to_lerobot_action(actions, step=0)    # receding horizon: take step 0
-            cmd = clamp_action(target, raw, args.max_step_deg, args.max_grip_step)
-            log.info("step %2d  infer=%4.0fms  cmd=%s",
-                     step, dt * 1000, {k: round(v, 1) for k, v in cmd.items()})
-            if not args.dry_run:
-                robust_send(robot, cmd)
-            time.sleep(max(0.0, period - dt))
+            chunk_T = int(np.asarray(actions["single_arm"]).shape[1])
+            horizon = max(1, min(args.action_horizon, chunk_T))
+
+            # Execute GR00T's PREDICTED TRAJECTORY (the whole chunk), not just step 0.
+            # Clamp each chunk step against the previous command (open-loop within
+            # the chunk) so the motion is GR00T's, only rate-limited for safety.
+            cur = {k: float(v) for k, v in raw.items() if k.endswith(".pos")}
+            last = cur
+            for h in range(horizon):
+                target = to_lerobot_action(actions, step=h)
+                cmd = clamp_action(target, cur, args.max_step_deg, args.max_grip_step,
+                                   grip_lo=args.grip_min, grip_hi=args.grip_max)
+                if not args.dry_run:
+                    robust_send(robot, cmd)
+                cur = cmd
+                last = cmd
+                for j in JOINTS:
+                    cmd_min[j] = min(cmd_min[j], cmd[f"{j}.pos"])
+                    cmd_max[j] = max(cmd_max[j], cmd[f"{j}.pos"])
+                time.sleep(period)
+            log.info("infer %2d  %4.0fms  chunk=%d/%d  last=%s",
+                     infer_i, dt * 1000, horizon, chunk_T,
+                     {k: round(v, 1) for k, v in last.items()})
     finally:
+        spans = {j: round(cmd_max[j] - cmd_min[j], 1) for j in JOINTS if cmd_max[j] > -1e9}
+        log.info("GR00T commanded travel per joint over the run (deg): %s", spans)
         try:
             robot.robot.disconnect()
         except Exception as e:
